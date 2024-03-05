@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "vn-net"
+version = "0.1.0"
+description = ""
+authors = ["Kamui <fin-kamui@pm.me>"]
+license = "GPL-v3"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "^1.26.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,8 +1,12 @@
+import os
+from pathlib import Path
 import torch
 from torch.nn import Embedding, Linear, Sequential, ReLU, Sigmoid, Parameter, Conv1d, BatchNorm1d, Dropout
 from dataclasses import dataclass
 from typing import List
 import numpy as np
+
+DATA_DIR = Path("./data")
 
 @dataclass
 class CINConfig:
@@ -17,17 +21,13 @@ class DNNConfig:
 @dataclass
 class NetConfig:
     fields: List[int] # [# of unique]
-
     m: int
-
     dnn: DNNConfig
     cin: CINConfig
-
     lr: int = 0.001
     l2: int = 0.0001
     dropout: int = 0 # Only for DNN
     embed_dim: int = 10 # per field for all m fields
-
     batch_size: int = 2048
 
 class DirectLinear(torch.nn.Module):
@@ -138,6 +138,9 @@ class xDeepFM(torch.nn.Module):
         self.cin = CIN(config).cuda()
         self.sigmoid = Sigmoid()
 
+        self.pt_file = DATA_DIR / f"vnfm_{self.name}.pt"
+        self.load_if_exists()
+
     def forward(self, x):
         e = self.embed(x)
         cin = self.cin(e)
@@ -146,3 +149,8 @@ class xDeepFM(torch.nn.Module):
         output = (dnn + cin + lin).squeeze(1)
         output = self.sigmoid(output)
         return output
+
+    def load_if_exists(self):
+        if os.path.isfile(self.pt_file):
+            checkpoint = torch.load(self.pt_file)
+            self.load_state_dict(checkpoint["model_state_dict"])
