@@ -1,7 +1,8 @@
 import torch
-from torch.nn import Embedding, Linear, Sequential, ReLU, Sigmoid, Parameter
+from torch.nn import Embedding, Linear, Sequential, ReLU, Sigmoid, Parameter, Conv1d
 from dataclasses import dataclass
 from typing import List
+import numpy as np
 
 @dataclass
 class CINConfig:
@@ -14,13 +15,8 @@ class DNNConfig:
     hidden: int = 100
 
 @dataclass
-class Field:
-    key: str # debug
-    num_unique: int
-
-@dataclass
 class NetConfig:
-    fields: List[Field]
+    fields: List[int] # [# of unique]
 
     m: int
 
@@ -32,51 +28,83 @@ class NetConfig:
     dropout: int = 0.5 # Only for DNN
     embed_dim: int = 10 # per field for all m fields
 
-class ConcatEmbedding:
-    """
-    Utility class to convert raw examples to a concatenated embedding vector
+    batch_size: int = 2048
 
-    Ex input: [1, 200] (user_id, movie_id)
-       output: [ ...d...  ....d... ]
+class DirectLinear(torch.nn.Module):
+    def __init__(self, fields):
+        super(DirectLinear, self).__init__()
 
-    Class must know which positions correspond to which fields
-    """
-
-    # FIXME: account for batch dimension
-    def __init__(self, fields: List[Field], dim):
-        self.m = len(fields)
-        self.dim = dim
-        self.pos_to_field = {}
-        self.embedding_layers = {}
-        self.onehot_size = 0
-
-        for pos, field in enumerate(fields):
-            self.pos_to_field[pos] = field
-            self.embedding_layers[pos] = Embedding(field.num_unique, dim) #.cuda()
-            self.onehot_size += field.num_unique
-
-    def raw_to_onehot(self, batch):
-        onehot = []
-        start_stop = []
-        i = 0
-        for pos in range(self.m):
-            feature = batch[:, pos]
-            num_classes = self.pos_to_field[pos].num_unique
-            enc = torch.nn.functional.one_hot(feature, num_classes=num_classes)
-            onehot.append(enc)
-            start_stop.append((i, num_classes - 1))
-            i += num_classes
-        onehot = torch.cat(onehot, dim=1).float()
-        return (onehot, start_stop)
+        self.embedding = Embedding(sum(fields), 1).cuda()
+        self.offsets = torch.tensor((0, *np.cumsum(fields)[:-1])).cuda()
     
-    def raw_to_embed(self, batch):
-        all_embedded = []
-        for pos in range(self.m):
-            feature = batch[:, pos]
-            embedding = self.embedding_layers[pos](feature)
-            all_embedded.append(embedding)
-        all_embedded = torch.stack(all_embedded, dim=1)
-        return all_embedded
+    def forward(self, x):
+        x_offsets = x + self.offsets
+        return self.embedding(x_offsets).flatten(1)
+    
+
+class FlatEmbedding(torch.nn.Module):
+    def __init__(self, fields, dim):
+        super(FlatEmbedding, self).__init__()
+
+        self.embedding = Embedding(sum(fields), dim).cuda()
+        self.offsets = torch.tensor((0, *np.cumsum(fields)[:-1])).cuda()
+    
+    def forward(self, x):
+        x_offsets = x + self.offsets
+        return self.embedding(x_offsets).flatten(1, 2)
+
+class DNN(torch.nn.Module):
+    def __init__(self, config):
+        super(DNN, self).__init__()
+
+        self.dnn = Sequential(
+            Linear(config.m * config.embed_dim, config.dnn.hidden),
+            ReLU(),
+            Linear(config.dnn.hidden, config.dnn.hidden),
+            ReLU(),
+            Linear(config.dnn.hidden, config.dnn.hidden),
+            ReLU()
+        )
+
+    def forward(self, e):
+        return self.dnn(e)
+
+class CIN(torch.nn.Module):
+    def __init__(self, config: NetConfig):
+        super(CIN, self).__init__()
+
+        self.config = config
+        # Input channels: H_k * m
+        # Output channels: H_k
+        self.first_conv = Conv1d(config.m * config.m, config.cin.hidden, 1)
+        self.conv = Conv1d(config.cin.hidden * config.m, config.cin.hidden, 1)
+        self.relu = ReLU()
+
+    def forward(self, e):
+        # e: (B, m, d)
+        e = e.unflatten(1, (self.config.m, self.config.embed_dim))
+        # transform it to (B, m, 1, d)
+        B = self.config.batch_size
+        H_k_size = self.config.cin.hidden # for now H_k will be all the same
+
+        X_0 = e.unsqueeze(2)
+        H = e
+
+        T = self.config.cin.layers
+
+        p_plus = torch.zeros((T, B, H_k_size)).cuda()
+
+        for i in range(T):
+            conv = self.conv if i > 0 else self.first_conv
+            outer = X_0 * H.unsqueeze(1) # (B, m, H_k or m, d)
+            outer = outer.flatten(1, 2) # (B, m * H_k, d)
+            feature_map = self.relu(conv(outer))
+            p_i = feature_map.sum(axis = 2)
+            p_plus[i] = p_i
+            H = feature_map
+
+        p_plus = p_plus.transpose(0, 1).flatten(1)
+        return p_plus
 
 
 class xDeepFM(torch.nn.Module):
@@ -94,67 +122,28 @@ class xDeepFM(torch.nn.Module):
         """
         super(xDeepFM, self).__init__()
 
-        self.embedding_layer = ConcatEmbedding(config.fields, config.embed_dim)
-
-        self.dnn = Sequential(
-            Linear(config.m * config.embed_dim, config.dnn.hidden),
-            ReLU(),
-            Linear(config.dnn.hidden, config.dnn.hidden),
-            ReLU(),
-            Linear(config.dnn.hidden, config.dnn.hidden),
-            ReLU()
-        )
-
-        self.cin_weight_0 = torch.zeros((config.cin.hidden, config.m, config.embed_dim))
-        self.cin_weights = torch.zeros((config.cin.layers - 1, config.cin.hidden, config.cin.hidden, config.embed_dim))
+        self.lin = DirectLinear(config.fields).cuda()
+        self.embed = FlatEmbedding(config.fields, config.embed_dim).cuda()
+        self.dnn = DNN(config).cuda()
+        self.cin = CIN(config).cuda()
 
         # output unit
-        self.W_linear = torch.zeros((self.embedding_layer.onehot_size, 1))
-        self.W_dnn = torch.zeros((config.dnn.hidden, 1))
-        self.W_cin = torch.zeros((config.cin.layers * config.cin.hidden, 1))
-        self.output_bias = Parameter(torch.zeros(1))
-        self.output_relu = ReLU()        
+        self.W_dnn = torch.zeros((config.dnn.hidden, 1)).cuda()
+        self.W_cin = torch.zeros((config.cin.layers * config.cin.hidden, 1)).cuda()
+        self.W_lin = torch.zeros((config.m, 1)).cuda()
+        self.output_bias = Parameter(torch.zeros(1)).cuda()
 
-        torch.nn.init.xavier_uniform_(self.cin_weight_0)
-        torch.nn.init.xavier_uniform_(self.cin_weights)
-        torch.nn.init.xavier_uniform_(self.W_linear)
         torch.nn.init.xavier_uniform_(self.W_dnn)
         torch.nn.init.xavier_uniform_(self.W_cin)
+        torch.nn.init.xavier_uniform_(self.W_lin)
 
         self.sigmoid = Sigmoid()
-        self.config = config
 
     def forward(self, x):
-        batch_size = 12
-
-        m, d = self.config.m, self.config.embed_dim
-        T, H_k = self.config.cin.layers, self.config.cin.hidden
-
-        X_0 = self.embedding_layer.raw_to_embed(x)
-        X_k_prev = X_0
-        p_plus = torch.zeros((T, batch_size, H_k))
-
-        for k in range(T):
-            X_k = torch.zeros((batch_size, H_k, d))
-            for h in range(H_k):
-                # Eq. 6
-                for i in range(H_k if k != 0 else m):
-                    for j in range(m):
-                        hadamard = X_k_prev[:, i] *  X_0[:, j]
-                        if k == 0:
-                            out = self.cin_weight_0[h, i, j] * hadamard
-                        else:
-                            out = self.cin_weights[k - 1, h, i, j] * hadamard
-                        X_k[:, h] = out
-            p_k = X_k.sum(axis=2)
-            p_plus[k] = p_k
-            X_k_prev = X_k
-
-        p_plus = p_plus.transpose(0, 1)
-        p_plus = p_plus.flatten(1)
-
-        x_dnn = self.dnn(X_0.flatten(1))
-        a, pos_a = self.embedding_layer.raw_to_onehot(x)
-        output = (x_dnn @ self.W_dnn) + (p_plus @ self.W_cin) + (a @ self.W_linear) + self.output_bias
+        e = self.embed(x)
+        cin = self.cin(e)
+        dnn = self.dnn(e)
+        lin = self.lin(x)
+        output = (dnn @ self.W_dnn) + (cin @ self.W_cin) + (lin @ self.W_lin) + self.output_bias
         output = self.sigmoid(output)
         return output
