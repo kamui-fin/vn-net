@@ -1,5 +1,5 @@
 import torch
-from torch.nn import Embedding, Linear, Sequential, ReLU, Sigmoid, Parameter, Conv1d
+from torch.nn import Embedding, Linear, Sequential, ReLU, Sigmoid, Parameter, Conv1d, BatchNorm1d, Dropout
 from dataclasses import dataclass
 from typing import List
 import numpy as np
@@ -25,7 +25,7 @@ class NetConfig:
 
     lr: int = 0.001
     l2: int = 0.0001
-    dropout: int = 0.5 # Only for DNN
+    dropout: int = 0 # Only for DNN
     embed_dim: int = 10 # per field for all m fields
 
     batch_size: int = 2048
@@ -36,10 +36,12 @@ class DirectLinear(torch.nn.Module):
 
         self.embedding = Embedding(sum(fields), 1).cuda()
         self.offsets = torch.tensor((0, *np.cumsum(fields)[:-1])).cuda()
+        self.bias = Parameter(torch.zeros(1))
     
     def forward(self, x):
         x_offsets = x + self.offsets
-        return self.embedding(x_offsets).flatten(1)
+        out = torch.sum(self.embedding(x_offsets).flatten(1), dim=1) + self.bias
+        return out.unsqueeze(1)
     
 
 class FlatEmbedding(torch.nn.Module):
@@ -47,6 +49,7 @@ class FlatEmbedding(torch.nn.Module):
         super(FlatEmbedding, self).__init__()
 
         self.embedding = Embedding(sum(fields), dim).cuda()
+        torch.nn.init.xavier_uniform_(self.embedding.weight.data)
         self.offsets = torch.tensor((0, *np.cumsum(fields)[:-1])).cuda()
     
     def forward(self, x):
@@ -59,11 +62,18 @@ class DNN(torch.nn.Module):
 
         self.dnn = Sequential(
             Linear(config.m * config.embed_dim, config.dnn.hidden),
+            BatchNorm1d(config.dnn.hidden),
             ReLU(),
+            Dropout(config.dropout),
             Linear(config.dnn.hidden, config.dnn.hidden),
+            BatchNorm1d(config.dnn.hidden),
             ReLU(),
+            Dropout(config.dropout),
             Linear(config.dnn.hidden, config.dnn.hidden),
-            ReLU()
+            BatchNorm1d(config.dnn.hidden),
+            ReLU(),
+            Dropout(config.dropout),
+            Linear(config.dnn.hidden, 1),
         )
 
     def forward(self, e):
@@ -74,11 +84,13 @@ class CIN(torch.nn.Module):
         super(CIN, self).__init__()
 
         self.config = config
-        # Input channels: H_k * m
-        # Output channels: H_k
-        self.first_conv = Conv1d(config.m * config.m, config.cin.hidden, 1)
-        self.conv = Conv1d(config.cin.hidden * config.m, config.cin.hidden, 1)
+        self.convs = torch.nn.ModuleList([
+            Conv1d(config.m * config.m, config.cin.hidden, 1),
+            Conv1d(config.cin.hidden * config.m, config.cin.hidden, 1),
+            Conv1d(config.cin.hidden * config.m, config.cin.hidden, 1)
+        ])
         self.relu = ReLU()
+        self.fc = Linear(config.cin.hidden * config.cin.layers, 1)
 
     def forward(self, e):
         # e: (B, m, d)
@@ -95,17 +107,15 @@ class CIN(torch.nn.Module):
         p_plus = torch.zeros((T, B, H_k_size)).cuda()
 
         for i in range(T):
-            conv = self.conv if i > 0 else self.first_conv
             outer = X_0 * H.unsqueeze(1) # (B, m, H_k or m, d)
             outer = outer.flatten(1, 2) # (B, m * H_k, d)
-            feature_map = self.relu(conv(outer))
+            feature_map = self.relu(self.convs[i](outer))
+            H = feature_map
             p_i = feature_map.sum(axis = 2)
             p_plus[i] = p_i
-            H = feature_map
 
         p_plus = p_plus.transpose(0, 1).flatten(1)
-        return p_plus
-
+        return self.fc(p_plus)
 
 class xDeepFM(torch.nn.Module):
     def __init__(self, config: NetConfig):
@@ -126,17 +136,6 @@ class xDeepFM(torch.nn.Module):
         self.embed = FlatEmbedding(config.fields, config.embed_dim).cuda()
         self.dnn = DNN(config).cuda()
         self.cin = CIN(config).cuda()
-
-        # output unit
-        self.W_dnn = torch.zeros((config.dnn.hidden, 1)).cuda()
-        self.W_cin = torch.zeros((config.cin.layers * config.cin.hidden, 1)).cuda()
-        self.W_lin = torch.zeros((config.m, 1)).cuda()
-        self.output_bias = Parameter(torch.zeros(1)).cuda()
-
-        torch.nn.init.xavier_uniform_(self.W_dnn)
-        torch.nn.init.xavier_uniform_(self.W_cin)
-        torch.nn.init.xavier_uniform_(self.W_lin)
-
         self.sigmoid = Sigmoid()
 
     def forward(self, x):
@@ -144,6 +143,6 @@ class xDeepFM(torch.nn.Module):
         cin = self.cin(e)
         dnn = self.dnn(e)
         lin = self.lin(x)
-        output = (dnn @ self.W_dnn) + (cin @ self.W_cin) + (lin @ self.W_lin) + self.output_bias
+        output = (dnn + cin + lin).squeeze(1)
         output = self.sigmoid(output)
         return output
